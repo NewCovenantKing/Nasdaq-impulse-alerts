@@ -1,18 +1,27 @@
 name: Impulse Scanner Alerts
 
 on:
+  # Automatically runs twice per weekday — London pre-open + NY pre-open
   schedule:
-    # runs at 06:30 UTC => 08:30 SAST (London pre-open)
-    - cron: '30 6 * * 1-5'
-    # runs at 12:00 UTC => 14:00 SAST (NY pre-open / as requested)
-    - cron: '0 12 * * 1-5'
-  workflow_dispatch: {}
+    - cron: '30 6 * * 1-5'   # 06:30 UTC => 08:30 SAST (London pre-open)
+    - cron: '30 12 * * 1-5'  # 12:30 UTC => 14:30 SAST (New York pre-open)
+  workflow_dispatch: {}      # Allow manual runs from GitHub Actions tab
 
 jobs:
   run-scanner:
     runs-on: ubuntu-latest
+
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      CHAT_ID: ${{ secrets.CHAT_ID }}
+      EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      SCAN_ZONE: London   # You can switch to NY in the 12:30 UTC run if you like
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -22,14 +31,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install yfinance python-telegram-bot pandas pytz
+          pip install yfinance python-telegram-bot pandas
 
       - name: Run impulse scanner
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID:  ${{ secrets.CHAT_ID }}
-          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
           python impulse_scanner.py
