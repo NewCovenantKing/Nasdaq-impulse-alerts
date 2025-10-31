@@ -1,0 +1,36 @@
+name: Impulse Scanner Alerts
+
+on:
+  schedule:
+    # Runs at 06:30 UTC (== 08:30 SAST) every weekday
+    - cron:  '30 6 * * 1-5'
+    # Option: 30 minutes before NY open — pick the correct UTC below and uncomment one:
+    # Eastern Standard Time (winter) NY open 14:30 UTC -> 14:00 UTC = 30 min before
+    # - cron: '0 14 * * 1-5'
+    # Eastern Daylight Time (summer) NY open 13:30 UTC -> 13:00 UTC = 30 min before
+    - cron:  '0 13 * * 1-5'
+
+  workflow_dispatch: {}
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance python-telegram-bot pytz
+
+      - name: Run impulse scanner
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID:  ${{ secrets.CHAT_ID }}
+        run: |
+          python impulse_scanner.py
