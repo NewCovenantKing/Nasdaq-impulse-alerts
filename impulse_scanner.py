@@ -1,31 +1,4 @@
-# impulse_scanner.py
-# Complete, standalone scanner:
-# - uses yfinance to fetch prices
-# - simple impulse heuristic + "Elliott-like" label
-# - marks session (Asia / London / NY)
-# - sends result to Telegram (BOT_TOKEN, CHAT_ID from env)
-# - robust to missing data and network errors
-
-import os
-import time
-import traceback
-from datetime import datetime, timezone, timedelta
-import pytz
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from telegram import Bot
-
-# ---------- CONFIG ----------
-SYMBOLS = {
-    # keys are friendly names; values are list of tickers tried in order
-    "NASDAQ": ["^NDX", "NQ=F", "NDX"],
-    "EURUSD": ["EURUSD=X"],
-    "GBPJPY": ["GBPJPY=X"],
-    "GOLD": ["GC=F", "XAUUSD=X"]
-}
-INTERVAL = "15m"          # interval used for impulse detection
-PERIOD = "5d"             # period to download
+# wnload
 MIN_BARS = 6              # minimum bars needed to evaluate
 MAX_RETRIES = 2           # retry attempts for yfinance
 # ----------------------------
