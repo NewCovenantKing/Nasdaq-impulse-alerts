@@ -216,3 +216,5 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(1)
+Commit message:   
+Replace impulse scanner with final version (email + Telegram, Elliott + SB sessions)
