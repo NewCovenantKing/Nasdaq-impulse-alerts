@@ -1,220 +1,211 @@
-# impulse_scanner.py
-# Final consolidated scanner:
-# - yfinance data (Yahoo)
-# - simple impulse detection (15m)
-# - simple Elliott label (Impulse / Correction)
-# - Silver Bullet session zone (SAST-based)
-# - Telegram alert + Email fallback
-# Requires env secrets: BOT_TOKEN, CHAT_ID, EMAIL_ADDRESS, EMAIL_PASSWORD, SEND_EMAIL_TO
+#!/usr/bin/env python3
+"""
+impulse_scanner.py
+- Pulls live prices (yfinance)
+- Detects simple impulses (last-5 candle trend)
+- Sends summary to Telegram and as fallback via Gmail
+- Designed for scheduled runs (GitHub Actions)
+"""
 
 import os
 import sys
-import smtplib
-import traceback
-from email.mime.text import MIMEText
-from datetime import datetime, time, timedelta
+import datetime as dt
 import pytz
-import yfinance as yf
+import traceback
+from email.message import EmailMessage
+import smtplib
 
-# ---------- CONFIG ----------
-# Symbols mapping (yfinance)
+import yfinance as yf
+from telegram import Bot
+
+# ---------- USER / ENV ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")           # string or int
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")  # app password for Gmail
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", 465))
+
+if not (EMAIL_ADDRESS and EMAIL_PASSWORD):
+    # Email is optional but recommended; if missing we still continue with Telegram if present
+    EMAIL_ADDRESS = None
+    EMAIL_PASSWORD = None
+
+if not BOT_TOKEN or not CHAT_ID:
+    # We'll still attempt email-only if Telegram creds missing; otherwise fail early
+    if not (EMAIL_ADDRESS and EMAIL_PASSWORD):
+        raise SystemExit("Missing BOT_TOKEN/CHAT_ID and no EMAIL credentials available. Add secrets.")
+
+# ---------- SYMBOLS ----------
 SYMBOLS = {
-    "NAS100": "^NDX",
+    "NAS100": "^NDX",        # Nasdaq 100 index
     "EURUSD": "EURUSD=X",
     "GBPJPY": "GBPJPY=X",
-    "GOLD": "GC=F"  # futures gold - commonly available
+    "GOLD": "GC=F"           # gold futures ticker; alternative: "XAUUSD=X"
 }
 
-# Interval we scan (15m)
-INTERVAL = "15m"
-PERIOD = "5d"  # last 5 days sufficient to analyze recent structure
+# ---------- SETTINGS ----------
+INTERVAL = "15m"     # 15-minute candles
+PERIOD = "5d"        # last 5 days for context
+CANDLES_TO_CHECK = 5
 
-# Minimal thresholds for impulse detection (tunable)
-IMPULSE_WINDOW = 3   # number of consecutive directional candles considered an impulse
-MIN_BODY_PCT = 0.002  # minimal body percent of price to avoid tiny candles (0.2%)
+# ---------- UTILS ----------
+def now_ts(tz="Africa/Johannesburg"):
+    tzobj = pytz.timezone(tz)
+    return dt.datetime.now(tzobj).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# Timezone for your schedule and session zones
-SAST = pytz.timezone("Africa/Johannesburg")
-
-# ---------- ENV / SECRETS ----------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
-SEND_EMAIL_TO = os.environ.get("SEND_EMAIL_TO") or EMAIL_ADDRESS
-
-# Validate
-if not (BOT_TOKEN and CHAT_ID and EMAIL_ADDRESS and EMAIL_PASSWORD and SEND_EMAIL_TO):
-    missing = [k for k,v in [
-        ("BOT_TOKEN", BOT_TOKEN),
-        ("CHAT_ID", CHAT_ID),
-        ("EMAIL_ADDRESS", EMAIL_ADDRESS),
-        ("EMAIL_PASSWORD", EMAIL_PASSWORD),
-        ("SEND_EMAIL_TO", SEND_EMAIL_TO)
-    ] if not v]
-    raise SystemExit(f"Missing environment secrets: {', '.join(missing)}")
-
-# ---------- UTILITIES ----------
-def now_sast():
-    return datetime.now(SAST)
-
-def session_zone(dt=None):
-    # dt is SAST datetime
-    if dt is None:
-        dt = now_sast()
-    h = dt.hour
-    # Simple session mapping (SAST): adjust if you prefer different boundaries
-    if 6 <= h < 11:
+def session_zone_from_utc(utc_dt=None):
+    # simple session mapping (UTC)
+    if utc_dt is None:
+        utc_dt = dt.datetime.utcnow()
+    hr = utc_dt.hour
+    # Asia session ~ 00:00-07:00 UTC, London ~ 07:00-15:00 UTC, NY ~ 13:00-21:00 UTC
+    if 0 <= hr < 7:
+        return "Asia"
+    if 7 <= hr < 13:
         return "London"
-    if 15 <= h < 21:
-        return "NewYork"
-    return "Asia"
+    return "NY"
 
 def send_telegram(text):
-    import requests
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
+    if not (BOT_TOKEN and CHAT_ID):
+        return False, "Telegram creds not set"
     try:
-        r = requests.post(url, json=payload, timeout=15)
-        r.raise_for_status()
-        return True, r.text
+        bot = Bot(token=BOT_TOKEN)
+        bot.send_message(chat_id=int(CHAT_ID), text=text)
+        return True, "sent"
     except Exception as e:
         return False, str(e)
 
-def send_email(subject, body):
+def send_email(subject, body, to_address):
+    if not (EMAIL_ADDRESS and EMAIL_PASSWORD):
+        return False, "Email creds missing"
     try:
-        msg = MIMEText(body)
+        msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = EMAIL_ADDRESS
-        msg["To"] = SEND_EMAIL_TO
-        server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30)
-        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_ADDRESS, [SEND_EMAIL_TO], msg.as_string())
-        server.quit()
-        return True, "ok"
+        msg["To"] = to_address
+        msg.set_content(body)
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as smtp:
+            smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            smtp.send_message(msg)
+        return True, "sent"
     except Exception as e:
         return False, str(e)
 
-def fetch_symbol_data(ticker, period=PERIOD, interval=INTERVAL):
-    # returns dataframe or raises
-    data = yf.download(ticker, period=period, interval=interval, progress=False, threads=False)
-    return data
+# ---------- PRICE + SIGNAL LOGIC ----------
+def fetch_data(symbol, interval=INTERVAL, period=PERIOD):
+    # Return DataFrame or None
+    data = None
+    try:
+        data = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
+        if data is None or data.empty:
+            return None, "no_data"
+        return data, None
+    except Exception as e:
+        return None, str(e)
 
-# ---------- SIMPLE PATTERN DETECTION ----------
-def detect_impulse(df):
-    """
-    Very simple heuristic:
-      - look at last IMPULSE_WINDOW candles
-      - if they are all bullish (close>open) and bodies are reasonably large -> up impulse
-      - or all bearish -> down impulse
-      - else -> correction / neutral
-    Returns: (label, direction, strength_info)
-    """
-    if df is None or len(df) < IMPULSE_WINDOW + 1:
-        return "NoData", None, "not enough candles"
+def is_impulse(df, candles=CANDLES_TO_CHECK):
+    # Heuristic impulse: last N closes trending up or down AND highs/lows aligning
+    if df is None or len(df) < candles:
+        return None  # insufficient data
+    tail = df.tail(candles)
+    closes = tail["Close"].values
+    highs = tail["High"].values
+    lows = tail["Low"].values
+    # monotonic increase (bull impulse)
+    bull = all(closes[i] > closes[i-1] for i in range(1, len(closes)))
+    bear = all(closes[i] < closes[i-1] for i in range(1, len(closes)))
+    if bull:
+        return {"wave": "Impulse", "direction": "Buy"}
+    if bear:
+        return {"wave": "Impulse", "direction": "Sell"}
+    # small correction detection: last candle reversed vs prior trend
+    # fallback: check if last 3 are mixed -> Correction
+    return {"wave": "Correction", "direction": "Neutral"}
 
-    recent = df.tail(IMPULSE_WINDOW)
-    closes = recent["Close"].values
-    opens = recent["Open"].values
-    bodies = abs(closes - opens)
-    avg_price = recent["Close"].mean() if recent["Close"].mean() else 1.0
-    # Require each body > MIN_BODY_PCT * price
-    body_thresh = MIN_BODY_PCT * avg_price
+# ---------- MESSAGE FORMAT ----------
+def format_alert(symbol_key, symbol, df, sig, session_zone):
+    price = df["Close"].iloc[-1]
+    time = df.index[-1].to_pydatetime().astimezone(pytz.timezone("Africa/Johannesburg")).strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"{symbol_key} ({symbol})",
+        f"Time: {time} SAST",
+        f"Price: {price:.4f}" if price >= 1 else f"Price: {price:.6f}",
+        f"Session: {session_zone}",
+        f"Wave: {sig.get('wave')}",
+        f"Direction: {sig.get('direction')}",
+        "",
+        "Playbook:",
+        "- If Impulse & Buy -> look for long setups into pullbacks",
+        "- If Impulse & Sell -> look for shorts into rallies",
+        "- If Correction -> wait for impulse confirmation",
+    ]
+    return "\n".join(lines)
 
-    bullish = all(closes[i] > opens[i] and bodies[i] > body_thresh for i in range(len(recent)))
-    bearish = all(closes[i] < opens[i] and bodies[i] > body_thresh for i in range(len(recent)))
-
-    # A small momentum measure: size of last body relative to avg
-    body_pct = bodies[-1] / avg_price
-
-    if bullish:
-        return "Impulse", "UP", f"body_pct={body_pct:.4f}"
-    if bearish:
-        return "Impulse", "DOWN", f"body_pct={body_pct:.4f}"
-    # fallback: look at last 5 closes slope
-    slope = closes[-1] - closes[0]
-    if abs(slope) / avg_price > 0.003:  # small trend
-        direction = "UP" if slope > 0 else "DOWN"
-        return "Correction", direction, f"slope={slope:.4f}"
-    return "Correction", None, "no clear directional impulse"
-
-# ---------- BUILD MESSAGE ----------
-def build_message(symbol_key, ticker, df):
-    now = now_sast()
-    session = session_zone(now)
-    time_str = now.strftime("%Y-%m-%d %H:%M SAST")
-    if df is None or df.empty:
-        return f"{symbol_key} ({ticker}) — No price data at {time_str} — session {session}"
-
-    last = df.tail(1).iloc[0]
-    price = last["Close"]
-    label, direction, info = detect_impulse(df)
-    # Simple Elliott-like note: if label == Impulse then wave = "Impulse (1)" else "Correction"
-    wave = "Impulse" if label == "Impulse" else "Correction"
-    bias = direction if direction else "Neutral"
-    # Daily high/low approximate from last 24h (using dataframe)
-    high = df["High"].max()
-    low = df["Low"].min()
-
-    msg = (
-        f"{symbol_key} ({ticker})\n"
-        f"Time: {time_str}\n"
-        f"Price: {price:.5f}\n"
-        f"Bias: {bias}\n"
-        f"Wave: {wave}\n"
-        f"SilverBulletZone: {session}\n"
-        f"Range(H/L): {high:.5f} / {low:.5f}\n"
-        f"Note: {info}"
-    )
-    return msg
-
-# ---------- MAIN RUN ----------
+# ---------- MAIN SCAN ----------
 def run_scan():
+    utc_now = dt.datetime.utcnow()
+    session_zone = session_zone_from_utc(utc_now)
     results = []
     errors = []
-    for skey, ticker in SYMBOLS.items():
+    for key, sym in SYMBOLS.items():
         try:
-            df = None
-            # download
-            df = fetch_symbol_data(ticker)
-            if df is None or df.empty:
-                raise ValueError(f"No data returned for {ticker}")
-            message = build_message(skey, ticker, df)
-            results.append((skey, ticker, message))
+            df, err = fetch_data(sym)
+            if err:
+                errors.append(f"{key}: fetch error -> {err}")
+                continue
+            sig = is_impulse(df)
+            if sig is None:
+                errors.append(f"{key}: insufficient data")
+                continue
+            msg = format_alert(key, sym, df, sig, session_zone)
+            results.append({"symbol_key": key, "message": msg, "sig": sig})
         except Exception as e:
             tb = traceback.format_exc()
-            errors.append((skey, ticker, str(e), tb))
+            errors.append(f"{key}: exception -> {e}\n{tb}")
+    return results, errors
 
-    # send consolidated telegram message and email
-    if results:
-        # Compose full text
-        header = f"Impulse Scanner Report — {now_sast().strftime('%Y-%m-%d %H:%M SAST')}\n"
-        body = header + "\n\n".join(r[2] for r in results)
-        ok_tg, resp_tg = send_telegram(body)
-        ok_em, resp_em = send_email("Impulse Scanner Report", body)
-        return {"telegram_ok": ok_tg, "telegram_resp": resp_tg, "email_ok": ok_em, "email_resp": resp_em, "errors": errors}
+# ---------- RUN & SEND ----------
+def main():
+    run_time = now_ts()
+    results, errors = run_scan()
+
+    header = f"Impulse Scanner report — {run_time}\n"
+    if not results and not errors:
+        body = header + "\nNo symbols scanned."
     else:
-        # nothing to send; report errors
-        body = f"No symbols scanned successfully. Errors:\n\n" + "\n\n".join(f"{e[0]} {e[1]} -> {e[2]}" for e in errors)
-        send_email("Impulse Scanner Errors", body)
-        return {"telegram_ok": False, "telegram_resp": "no results", "email_ok": True, "email_resp": "error email sent", "errors": errors}
+        body_parts = [header]
+        for r in results:
+            body_parts.append(r["message"])
+            body_parts.append("-" * 30)
+        if errors:
+            body_parts.append("Errors / notes:")
+            body_parts.extend(errors)
+        body = "\n".join(body_parts)
+
+    # Try Telegram first
+    tele_ok, tele_msg = send_telegram(body)
+    email_ok, email_msg = (False, "not attempted")
+    # If telegram failed or email creds present, send email as backup
+    if EMAIL_ADDRESS and EMAIL_PASSWORD:
+        # send to the same EMAIL_ADDRESS (you) as backup
+        email_ok, email_msg = send_email("Impulse Scanner Report", body, EMAIL_ADDRESS)
+
+    # print short result for logs (GitHub Actions)
+    print("TELEGRAM:", tele_ok, tele_msg)
+    print("EMAIL:", email_ok, email_msg)
+    if errors:
+        print("SCAN ERRORS:")
+        for e in errors:
+            print("-", e)
+
+    # Exit codes: 0 OK (sent at least one), 1 otherwise (so Action flags failure)
+    if tele_ok or email_ok:
+        print("Alert delivered.")
+        sys.exit(0)
+    else:
+        print("No delivery method succeeded.")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    try:
-        out = run_scan()
-        # Print outcome for GitHub Actions log
-        print("Scan result:", out)
-        # Exit 0 even if some per-symbol errors occurred
-        sys.exit(0)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print("Fatal error:", str(e))
-        print(tb)
-        # attempt to email fatal
-        try:
-            send_email("Impulse Scanner Fatal Error", f"{e}\n\n{tb}")
-        except Exception:
-            pass
-        sys.exit(1)
-Commit message:   
-Replace impulse scanner with final version (email + Telegram, Elliott + SB sessions)
+    main()
