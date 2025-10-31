@@ -45,7 +45,29 @@ def check_all_and_notify():
             messages.append(f"{name} impulse detected → {direction}")
     if messages:
         text = f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}] Impulses:\n" + "\n".join(messages)
-        bot.send_message(chat_id=CHAT_ID, text=text)
+        # ---------- Compose enhanced alert ----------
+# these names are tolerant: if your script already sets direction, wave, sb_zone, price, it will use them.
+direction = globals().get("direction") or locals().get("direction") or "N/A"
+wave      = globals().get("wave")      or locals().get("wave")      or ("Impulse" if globals().get("impulse_detected") else "Correction" if globals().get("impulse_detected") is not None else "N/A")
+sb_zone   = globals().get("sb_zone")   or locals().get("sb_zone")   or "N/A"
+price     = globals().get("price")     or locals().get("price")     or globals().get("last_price") or "N/A"
+
+from datetime import datetime
+now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+message = (
+    f"📣 *Scanner Summary*\n"
+    f"• Symbol: {globals().get('symbol') or 'N/A'}\n"
+    f"• Direction: *{direction}*\n"
+    f"• Wave: {wave}\n"
+    f"• SilverBullet zone: {sb_zone}\n"
+    f"• Price: {price}\n"
+    f"• Time: {now}"
+)
+
+# send as plain text (or set parse_mode="Markdown" if you like)
+bot.send_message(CHAT_ID, message)
+# ---------- end enhanced alert ----------
 
 if __name__ == "__main__":
     # run once (GitHub Actions will schedule). For local runs, you can loop.
