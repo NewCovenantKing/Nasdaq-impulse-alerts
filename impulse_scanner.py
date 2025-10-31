@@ -1,190 +1,245 @@
-#!/usr/bin/env python3
 # impulse_scanner.py
-# Sends simple "impulse" alerts to Telegram + email (Gmail) as backup.
-# Requires: yfinance, python-telegram-bot, pandas
-# Env vars (set in GitHub Actions secrets): BOT_TOKEN, CHAT_ID, EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_TO
+# Single-file scanner: yfinance -> simple direction/wave detection -> Telegram + Email
+# Requirements: yfinance, python-telegram-bot
+# This script is intentionally conservative/simple (easy to reason about)
 
 import os
-import datetime as dt
-import yfinance as yf
-import pandas as pd
-from telegram import Bot
+import sys
+import time
+import math
 import smtplib
 from email.message import EmailMessage
 import traceback
-import sys
 
-# --- Config / symbols ---
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from telegram import Bot
+
+# ---------------- CONFIG ----------------
 SYMBOLS = {
-    "NAS100": "^NDX",
-    "EURUSD": "EURUSD=X",
-    "GBPJPY": "GBPJPY=X",
-    "GOLD": "GC=F"   # example
+    # user-friendly key : yahoo ticker(s) to try in order
+    "NAS100": ["^NDX", "NQ=F", "NDX"],         # try several options
+    "EURUSD": ["EURUSD=X"],
+    "GBPJPY": ["GBPJPY=X"],
+    "USDJPY": ["JPY=X", "USDJPY=X"],
+    "SPX": ["^GSPC", "SPY"],
+    # add or remove tickers here
 }
 
-# thresholds
-IMPULSE_PCT_THRESHOLD = 0.004  # 0.4% change considered impulse (adjustable)
+# how many minutes per candle expected by workflow (we use 15m)
+INTERVAL = "15m"
+PERIOD = "5d"  # how much history to download (5 days covers many sessions)
 
-# --- Helpers ---
-def now_utc():
-    return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+# detection thresholds (tune later if needed)
+EMA_PERIOD = 8        # short EMA for slope
+IMPULSE_BARS = 3      # number of consecutive trend bars to call "impulse"
+TP_ATR_MULT = 2.0     # take-profit = price +/- TP_ATR_MULT * ATR
+SL_ATR_MULT = 1.0     # stop-loss = price +/- SL_ATR_MULT * ATR
 
-def detect_zone(now_utc_dt):
-    # Determine whether this run is London pre-open or NY pre-open, based on UTC hour
-    h = now_utc_dt.hour
-    # We scheduled runs at 06:30 UTC (London pre-open) and 13:00 UTC (NY pre-open)
-    if h in (6, 7, 8):
-        return "London"
-    if h in (12, 13, 14):
-        return "New York"
-    return "Unknown"
+# ---------------- HELPERS ----------------
+def safe_download(ticker):
+    """Try to download a ticker and return DataFrame or None."""
+    try:
+        # auto_adjust True will normalize splits/dividends
+        df = yf.download(ticker, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception:
+        return None
 
-def fetch_price(symbol, period="5d", interval="15m"):
-    # Return last row (timestamp and close) or raise
-    data = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
-    if data is None or data.empty:
-        raise ValueError(f"No data found for {symbol}")
-    # use the last available close
-    last = data.iloc[-1]
-    prev = data.iloc[-2] if len(data) >= 2 else None
-    return {
-        "symbol": symbol,
-        "time": last.name,
-        "close": float(last["Close"]),
-        "prev_close": float(prev["Close"]) if prev is not None else None,
-        "raw": last
-    }
+def compute_atr(df, n=14):
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(n, min_periods=1).mean()
+    return atr
 
-def simple_direction_and_wave(price, prev_close):
-    if prev_close is None:
-        return "Neutral", "No impulse (no history)"
-    change = (price - prev_close) / prev_close
-    if change > IMPULSE_PCT_THRESHOLD:
-        return "Buy", "Impulse"
-    if change < -IMPULSE_PCT_THRESHOLD:
-        return "Sell", "Impulse"
-    # otherwise small move -> correction/neutral
-    return "Neutral", "Correction/No impulse"
+def detect_direction_and_wave(df):
+    """
+    Simple logic:
+      - compute EMA(period=EMA_PERIOD) and slope of EMA over last 3 points
+      - direction = Buy if price > EMA and EMA slope > 0.0001, Sell if opposite
+      - wave = Impulse if last IMPULSE_BARS candles all move in same direction (higher highs/lows or lower lows/highs)
+    """
+    close = df['Close']
+    if close.empty:
+        return "Neutral", "No data"
 
-def basic_tp_sl(price):
-    # small example: TP = 0.5% away, SL = 0.5% away (example)
-    tp = price * (1 + 0.005)
-    sl = price * (1 - 0.005)
-    return round(tp, 6), round(sl, 6)
+    ema = close.ewm(span=EMA_PERIOD, adjust=False).mean()
+    if len(ema) < 3:
+        return "Neutral", "No data"
 
+    slope = (ema.iloc[-1] - ema.iloc[-3]) / ema.iloc[-3] if ema.iloc[-3] != 0 else 0.0
+
+    last_price = close.iloc[-1]
+    direction = "Neutral"
+    if last_price > ema.iloc[-1] and slope > 0.0002:
+        direction = "Buy"
+    elif last_price < ema.iloc[-1] and slope < -0.0002:
+        direction = "Sell"
+    else:
+        direction = "Neutral"
+
+    # impulse detection
+    impulse = False
+    if len(df) >= IMPULSE_BARS:
+        # examine last IMPULSE_BARS candles
+        recent = df.tail(IMPULSE_BARS)
+        increases = (recent['Close'].diff() > 0).sum()
+        decreases = (recent['Close'].diff() < 0).sum()
+        if increases == IMPULSE_BARS - 1 and direction == "Buy":
+            impulse = True
+        elif decreases == IMPULSE_BARS - 1 and direction == "Sell":
+            impulse = True
+
+    wave = "Impulse" if impulse else "Correction/No impulse"
+    return direction, wave
+
+def compute_tp_sl(df, direction):
+    """Compute ATR-based TP/SL (returns tuple (TP, SL))"""
+    if df is None or df.empty:
+        return None, None
+    atr = compute_atr(df)
+    last_atr = atr.iloc[-1] if not atr.empty else None
+    last_price = df['Close'].iloc[-1]
+    if last_atr is None or math.isnan(last_atr) or last_atr == 0:
+        return None, None
+    if direction == "Buy":
+        tp = last_price + TP_ATR_MULT * last_atr
+        sl = last_price - SL_ATR_MULT * last_atr
+    elif direction == "Sell":
+        tp = last_price - TP_ATR_MULT * last_atr
+        sl = last_price + SL_ATR_MULT * last_atr
+    else:
+        tp, sl = None, None
+    return tp, sl
+
+def format_price(p):
+    return f"{p:.6f}" if isinstance(p, float) else str(p)
+
+# ---------------- OUTPUT (Telegram + Email) ----------------
 def send_telegram(bot_token, chat_id, text):
-    bot = Bot(token=bot_token)
-    bot.send_message(chat_id=chat_id, text=text)
+    try:
+        bot = Bot(token=bot_token)
+        # split if huge (Telegram has message size limits) — but try once
+        bot.send_message(chat_id=chat_id, text=text)
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
-def send_email(smtp_user, smtp_password, to_addr, subject, body):
-    msg = EmailMessage()
-    msg["From"] = smtp_user
-    msg["To"] = to_addr
-    msg["Subject"] = subject
-    msg.set_content(body)
-    # Gmail SMTP TLS
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.send_message(msg)
+def send_email(smtp_user, smtp_pass, to_addr, subject, body):
+    try:
+        msg = EmailMessage()
+        msg["From"] = smtp_user
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        msg.set_content(body)
 
-# --- Main ---
+        # Gmail SSL on 465
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+            s.login(smtp_user, smtp_pass)
+            s.send_message(msg)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+# ---------------- MAIN ----------------
 def main():
+    # env
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
     CHAT_ID = os.environ.get("CHAT_ID")
     EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
     EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
     EMAIL_TO = os.environ.get("EMAIL_TO")
 
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Missing BOT_TOKEN or CHAT_ID environment variables", file=sys.stderr)
-        raise SystemExit("Missing BOT_TOKEN or CHAT_ID environment variables")
+    if not BOT_TOKEN:
+        print("Warning: BOT_TOKEN not set. Telegram messages will not be sent.")
+    if not CHAT_ID:
+        print("Warning: CHAT_ID not set. Telegram messages will not be sent.")
+    if not EMAIL_ADDRESS or not EMAIL_PASSWORD or not EMAIL_TO:
+        print("Warning: Email settings incomplete. Email will not be sent.")
 
-    # CHAT_ID should be numeric string (no <> and no spaces)
-    chat_id = CHAT_ID.strip()
-
-    # Determine zone
-    now = now_utc()
-    zone = detect_zone(now)
-
-    results = []
-    errors = []
-
-    for name, sym in SYMBOLS.items():
-        try:
-            info = fetch_price(sym)
-            price = info["close"]
-            prev = info["prev_close"]
-            direction, wave = simple_direction_and_wave(price, prev)
-            tp, sl = basic_tp_sl(price)
-            results.append({
-                "name": name,
-                "yf_ticker": sym,
-                "time": info["time"],
-                "price": price,
-                "direction": direction,
-                "wave": wave,
-                "tp": tp,
-                "sl": sl
-            })
-        except Exception as e:
-            errors.append(f"{name} ({sym}) error: {e}")
-            # continue with next symbol
+    out_lines = []
+    out_lines.append("Impulse Scanner Report\n")
+    failed = []
+    for key, try_list in SYMBOLS.items():
+        df = None
+        ticker_used = None
+        for t in try_list:
+            df = safe_download(t)
+            if df is not None and not df.empty:
+                ticker_used = t
+                break
+        if df is None or df.empty:
+            failed.append(key)
+            out_lines.append(f"{key}: FAILED to find price data for {try_list}\n")
             continue
 
-    # Build message text
-    lines = []
-    header = f"Impulse Scanner Report\nRun time (UTC): {now.isoformat()}  Zone: {zone}\n"
-    lines.append(header)
+        # compute
+        direction, wave = detect_direction_and_wave(df)
+        tp, sl = compute_tp_sl(df, direction)
+        last_time = df.index[-1].isoformat()
+        last_price = df['Close'].iloc[-1]
 
-    if results:
-        for r in results:
-            lines.append(f"{r['name']} ({r['yf_ticker']})")
-            lines.append(f"Time: {r['time']}")
-            lines.append(f"Price: {r['price']}")
-            lines.append(f"Direction: {r['direction']}")
-            lines.append(f"Wave: {r['wave']}")
-            lines.append(f"Zone: {zone}")
-            lines.append(f"TP: {r['tp']}  SL: {r['sl']}")
-            lines.append("")  # blank
-    else:
-        lines.append("No results (all failed).")
+        out_lines.append(f"{key} ({ticker_used})")
+        out_lines.append(f"Time: {last_time} UTC")
+        out_lines.append(f"Price: {format_price(last_price)}")
+        out_lines.append(f"Direction: {direction}")
+        out_lines.append(f"Wave: {wave}")
+        if tp is not None and sl is not None:
+            out_lines.append(f"TP: {format_price(tp)}  SL: {format_price(sl)}")
+        out_lines.append("")  # blank line
 
-    if errors:
-        lines.append("Errors:")
-        lines.extend(errors)
+    summary = "\n".join(out_lines)
 
-    message_text = "\n".join(lines)
-
-    # Send Telegram
-    try:
-        send_telegram(BOT_TOKEN, chat_id, message_text)
-        print("Telegram message sent")
-    except Exception as e:
-        print("Telegram send failed:", e, file=sys.stderr)
-        errors.append(f"Telegram send failed: {e}")
-
-    # Send email backup if email secrets provided
-    if EMAIL_ADDRESS and EMAIL_PASSWORD and EMAIL_TO:
+    # send telegram
+    tel_ok = False
+    tel_err = None
+    if BOT_TOKEN and CHAT_ID:
         try:
-            send_email(EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_TO, "Impulse Scanner Report", message_text)
-            print("Email sent")
+            tel_ok, tel_err = send_telegram(BOT_TOKEN, CHAT_ID, summary)
         except Exception as e:
-            print("Email send failed:", e, file=sys.stderr)
-            errors.append(f"Email send failed: {e}")
+            tel_ok = False
+            tel_err = str(e)
 
-    # If there were errors, raise non-zero for GitHub Actions visibility
-    if errors:
-        raise SystemExit("Completed with errors: " + "; ".join(errors))
-    else:
-        print("Completed OK")
+    # send email fallback/backup
+    mail_ok = False
+    mail_err = None
+    if EMAIL_ADDRESS and EMAIL_PASSWORD and EMAIL_TO:
+        subject = "Impulse Scanner Report"
+        try:
+            mail_ok, mail_err = send_email(EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_TO, subject, summary)
+        except Exception as e:
+            mail_ok = False
+            mail_err = str(e)
+
+    # final log
+    final = [
+        "=== Delivery ===",
+        f"Telegram sent: {tel_ok} (err: {tel_err})",
+        f"Email sent: {mail_ok} (err: {mail_err})",
+        "",
+        "=== Details ===",
+        summary
+    ]
+    final_msg = "\n".join(final)
+    print(final_msg)
+
+    # if telegram failed but email succeeded, optionally print that to console (Actions will show)
+    if not tel_ok and not mail_ok:
+        # exit non-zero so Actions shows failure
+        print("Both Telegram and Email failed to deliver. See logs above.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     try:
         main()
-    except SystemExit as se:
-        print("Exit:", se, file=sys.stderr)
-        raise
     except Exception:
         traceback.print_exc()
-        raise
+        sys.exit(1)
